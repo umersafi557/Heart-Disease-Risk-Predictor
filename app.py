@@ -1,10 +1,13 @@
 from pathlib import Path
+import warnings
 
 import joblib
-import pandas as pd
 import streamlit as st
 
+from preprocessing import build_model_input
 
+
+PROJECT_DIR = Path(__file__).resolve().parent
 ARTIFACTS = {
     "model": "heart_disease_model.pkl",
     "scaler": "scaler.pkl",
@@ -15,23 +18,29 @@ ARTIFACTS = {
 
 @st.cache_resource
 def load_artifacts():
-    """Load the model and preprocessing artifacts once per Streamlit session."""
-    missing = [filename for filename in ARTIFACTS.values() if not Path(filename).is_file()]
+    """Load and validate the model and preprocessing artifacts."""
+    artifact_paths = {name: PROJECT_DIR / filename for name, filename in ARTIFACTS.items()}
+    missing = [path.name for path in artifact_paths.values() if not path.is_file()]
     if missing:
         raise FileNotFoundError(
             "Required project file(s) are missing: " + ", ".join(missing)
         )
 
-    model = joblib.load(ARTIFACTS["model"])
-    scaler = joblib.load(ARTIFACTS["scaler"])
-    numerical_columns = list(joblib.load(ARTIFACTS["numerical_columns"]))
-    training_columns = list(joblib.load(ARTIFACTS["training_columns"]))
+    # Joblib/pickle files must only be loaded from a trusted source.
+    with warnings.catch_warnings(record=True) as caught_warnings:
+        warnings.simplefilter("always")
+        model = joblib.load(artifact_paths["model"])
+        scaler = joblib.load(artifact_paths["scaler"])
+        numerical_columns = list(joblib.load(artifact_paths["numerical_columns"]))
+        training_columns = list(joblib.load(artifact_paths["training_columns"]))
 
     if len(training_columns) != len(set(training_columns)):
         raise ValueError("training_columns.pkl contains duplicate feature names.")
+    if len(numerical_columns) != len(set(numerical_columns)):
+        raise ValueError("numerical_columns.pkl contains duplicate feature names.")
     if not set(numerical_columns).issubset(training_columns):
         raise ValueError(
-            "The numerical feature list contains columns not present in training_columns.pkl."
+            "numerical_columns.pkl contains columns not present in training_columns.pkl."
         )
     if getattr(scaler, "n_features_in_", len(numerical_columns)) != len(numerical_columns):
         raise ValueError(
@@ -42,57 +51,18 @@ def load_artifacts():
             "The model's expected feature count does not match training_columns.pkl."
         )
 
+    model_features = getattr(model, "feature_names_in_", None)
+    if model_features is not None and list(model_features) != training_columns:
+        raise ValueError(
+            "The saved model feature names/order do not match training_columns.pkl."
+        )
+    scaler_features = getattr(scaler, "feature_names_in_", None)
+    if scaler_features is not None and list(scaler_features) != numerical_columns:
+        raise ValueError(
+            "The saved scaler feature names/order do not match numerical_columns.pkl."
+        )
+
     return model, scaler, numerical_columns, training_columns
-
-
-def build_model_input(values, training_columns):
-    """Create one row using the fixed feature schema from model training."""
-    numeric_values = {
-        "age": values["age"],
-        "trestbps": values["trestbps"],
-        "chol": values["chol"],
-        "thalch": values["thalch"],
-        "oldpeak": values["oldpeak"],
-        "ca": values["ca"],
-        "age_per_trestbps": values["age"] / (values["trestbps"] + 1),
-        "chol_per_thalch": values["chol"] / (values["thalch"] + 1),
-        "chol_per_age": values["chol"] / (values["age"] + 1),
-        "trest_per_age": values["trestbps"] / (values["age"] + 1),
-        # Retained for compatibility with the saved model. Verify this formula
-        # against the original training pipeline before using this model for research.
-        "pulse_pressure": values["trestbps"] - 80,
-        "high_bp": int(values["trestbps"] >= 140),
-        "high_chol": int(values["chol"] >= 240),
-    }
-
-    # Preserve the exact feature order used when the model was trained.
-    row = pd.DataFrame(0.0, index=[0], columns=training_columns)
-    for column, value in numeric_values.items():
-        if column in row.columns:
-            row.at[0, column] = float(value)
-
-    categorical_values = {
-        "sex_Male": values["sex"] == "Male",
-        "dataset_Hungary": values["dataset"] == "Hungary",
-        "dataset_Switzerland": values["dataset"] == "Switzerland",
-        "dataset_VA Long Beach": values["dataset"] == "VA Long Beach",
-        "cp_atypical angina": values["cp"] == "atypical angina",
-        "cp_non-anginal": values["cp"] == "non-anginal",
-        "cp_typical angina": values["cp"] == "typical angina",
-        "fbs_True": values["fbs"],
-        "restecg_normal": values["restecg"] == "normal",
-        "restecg_st-t abnormality": values["restecg"] == "st-t abnormality",
-        "exang_True": values["exang"],
-        "slope_flat": values["slope"] == "flat",
-        "slope_upsloping": values["slope"] == "upsloping",
-        "thal_normal": values["thal"] == "normal",
-        "thal_reversable defect": values["thal"] == "reversable defect",
-    }
-    for column, selected in categorical_values.items():
-        if column in row.columns:
-            row.at[0, column] = float(selected)
-
-    return row
 
 
 st.set_page_config(page_title="Heart Disease Risk Predictor", page_icon="❤️", layout="wide")
@@ -101,14 +71,18 @@ st.write(
     "Enter the available measurements and click **Predict**. "
     "This educational demo is not medical advice and must not be used for diagnosis."
 )
+st.info(
+    "The saved model's class labels and clinical performance have not been verified here. "
+    "Treat the output as an unvalidated model class, not a diagnosis or a personal risk estimate."
+)
 
 try:
     model, scaler, numerical_columns, training_columns = load_artifacts()
 except Exception as exc:
     st.error(f"Could not load the model files: {exc}")
     st.info(
-        "Keep app.py, heart_disease_model.pkl, scaler.pkl, "
-        "numerical_columns.pkl, and training_columns.pkl in the same project folder."
+        "Keep app.py, preprocessing.py, heart_disease_model.pkl, scaler.pkl, "
+        "numerical_columns.pkl, and training_columns.pkl in the project folder."
     )
     st.stop()
 
@@ -140,7 +114,12 @@ with st.form("prediction_form"):
         )
         exang = st.selectbox("Exercise-induced angina", [False, True])
         oldpeak = st.number_input(
-            "ST depression (oldpeak)", min_value=0.0, max_value=10.0, value=1.0, step=0.1
+            "ST depression (oldpeak)",
+            min_value=-5.0,
+            max_value=10.0,
+            value=1.0,
+            step=0.1,
+            help="Enter the value reported by the test; the model's original training range is not documented here.",
         )
         slope = st.selectbox(
             "Slope of peak exercise ST", ["downsloping", "flat", "upsloping"]
@@ -151,6 +130,7 @@ with st.form("prediction_form"):
         dataset = st.selectbox(
             "Dataset source",
             ["Cleveland", "Hungary", "Switzerland", "VA Long Beach"],
+            help="Dataset source is a feature used by this saved model; it is not a patient measurement.",
         )
         ca = st.number_input(
             "Major vessels colored by fluoroscopy (0–3)",
@@ -188,32 +168,39 @@ if submitted:
         prediction = model.predict(model_input)[0]
 
         st.subheader("Model output")
-        if prediction == 1:
-            st.error("The model classified this input as the positive class (1).")
-        elif prediction == 0:
-            st.success("The model classified this input as the negative class (0).")
-        else:
-            st.warning(f"The model returned class: {prediction!r}")
+        st.metric("Predicted model class", str(prediction))
+        st.caption(
+            "Class 0/1 meanings must be confirmed from the original target labels. "
+            "This class is not a calibrated probability or a diagnosis."
+        )
 
-        if hasattr(model, "predict_proba"):
+        # Some estimators expose predict_proba only when explicitly enabled.
+        supports_probability = hasattr(model, "predict_proba") and getattr(
+            model, "probability", True
+        ) is not False
+        if supports_probability:
             classes = list(getattr(model, "classes_", []))
             if 1 in classes:
                 positive_index = classes.index(1)
                 probability = float(model.predict_proba(model_input)[0][positive_index])
                 st.write(f"Model-estimated probability for class 1: **{probability:.1%}**")
             else:
-                st.caption("Probability not shown because class 1 is not in the model's class labels.")
+                st.caption(
+                    "Probability not shown because class 1 is not in the model's class labels."
+                )
         else:
-            st.caption("This model does not provide probability estimates.")
+            st.caption(
+                "This estimator does not expose probability estimates with its current settings."
+            )
 
         st.warning(
-            "Educational demonstration only. Class 0/1 meanings and clinical validity "
-            "must be confirmed from the original training labels and evaluation. "
-            "This result is not a diagnosis or medical advice."
+            "Educational demonstration only. Confirm the labels, original preprocessing, "
+            "validation procedure, and performance metrics before any research use. "
+            "Do not use this result to make healthcare decisions."
         )
     except Exception as exc:
         st.error(f"Prediction failed: {exc}")
         st.caption(
-            "If this mentions feature names or dimensions, verify that the saved model, "
-            "scaler, numerical_columns.pkl, and training_columns.pkl came from the same training run."
+            "Check that the model, scaler, numerical_columns.pkl, training_columns.pkl, "
+            "and preprocessing.py all come from the same training pipeline."
         )
