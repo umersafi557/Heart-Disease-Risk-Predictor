@@ -1,6 +1,4 @@
 from pathlib import Path
-import warnings
-
 import joblib
 import streamlit as st
 
@@ -27,12 +25,11 @@ def load_artifacts():
         )
 
     # Joblib/pickle files must only be loaded from a trusted source.
-    with warnings.catch_warnings(record=True) as caught_warnings:
-        warnings.simplefilter("always")
-        model = joblib.load(artifact_paths["model"])
-        scaler = joblib.load(artifact_paths["scaler"])
-        numerical_columns = list(joblib.load(artifact_paths["numerical_columns"]))
-        training_columns = list(joblib.load(artifact_paths["training_columns"]))
+    # Keep library warnings visible (for example, scikit-learn version warnings).
+    model = joblib.load(artifact_paths["model"])
+    scaler = joblib.load(artifact_paths["scaler"])
+    numerical_columns = list(joblib.load(artifact_paths["numerical_columns"]))
+    training_columns = list(joblib.load(artifact_paths["training_columns"]))
 
     if len(training_columns) != len(set(training_columns)):
         raise ValueError("training_columns.pkl contains duplicate feature names.")
